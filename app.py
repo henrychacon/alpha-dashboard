@@ -28,8 +28,7 @@ with header_col1:
 with header_col2:
     st.markdown(
         """
-        # Alpha Data  
-        **Insight That Protects.**
+        ### Dashboard built on synthetic dataset for exploring potential prescription anomalies and risk patterns.
         """,
         unsafe_allow_html=True,
     )
