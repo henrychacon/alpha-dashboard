@@ -3,6 +3,7 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
+import pgeocode
 
 # =========================================
 # Page config
@@ -42,6 +43,7 @@ st.caption(
 # Data loader (from private GitHub repo via secrets)
 # =========================================
 
+@st.cache_data(show_spinner=True)
 def load_data_from_github():
     """
     Load Excel file from a private GitHub repository using a personal access token.
@@ -53,7 +55,6 @@ def load_data_from_github():
       - GITHUB_BRANCH
       - GITHUB_DATA_PATH
     """
-    # Basic sanity check of secrets
     required_keys = [
         "GITHUB_TOKEN",
         "GITHUB_USER",
@@ -84,11 +85,8 @@ def load_data_from_github():
 
     data_bytes = resp.content
 
-    # IMPORTANT: Excel read can fail if openpyxl not installed
-    try:
-        df = pd.read_excel(io.BytesIO(data_bytes), dtype=str, engine="openpyxl")
-    except Exception as e:
-        raise RuntimeError(f"Error reading Excel with pandas/openpyxl: {e}")
+    # Read Excel
+    df = pd.read_excel(io.BytesIO(data_bytes), dtype=str, engine="openpyxl")
 
     # Basic numeric conversions
     num_cols = [
@@ -118,37 +116,99 @@ def load_data_from_github():
 
 
 # =========================================
-# Try to load data and show clear errors
+# Load data (with error display if needed)
 # =========================================
 try:
     with st.spinner("Loading data from private GitHub repo..."):
         df = load_data_from_github()
 except Exception as e:
     st.error("❌ Failed to load the dataset.")
-    st.exception(e)  # show full traceback in the UI
+    st.exception(e)
     st.stop()
 
 st.success("✅ Data loaded successfully.")
 
-st.write("**Preview of columns and first 5 rows (for debugging):**")
-st.write(f"Shape: {df.shape[0]} rows × {df.shape[1]} columns")
-st.dataframe(df.head())
-
 # =========================================
-# From here down is the actual dashboard logic
-# (kept simpler at first to make sure loading works)
+# Identify key columns
 # =========================================
-
 flag_cols = [c for c in df.columns if c.startswith("T/F")]
+has_zip_distance_flag = "T/F Distance" in flag_cols
+has_zip_distance_value = "Patient - Pharmacy ZIP Distance_num" in df.columns
+has_impossible_days_flag = "T/F Impossible Days Supply" in flag_cols
+
 total_records = len(df)
 total_with_any_violation = int(df["AnyViolation"].sum()) if "AnyViolation" in df.columns else 0
 
-st.subheader("Overview")
-c1, c2 = st.columns(2)
-c1.metric("Total Records", f"{total_records:,}")
-c2.metric("Records with Any Violation", f"{total_with_any_violation:,}")
+# =========================================
+# Sidebar – filters
+# =========================================
+st.sidebar.header("Filters")
 
-st.subheader("Violation Flags Summary")
+# Violation flags selector
+selected_flags = st.sidebar.multiselect(
+    "Select violation flags to focus on",
+    options=flag_cols,
+    default=flag_cols,
+    help="Rows are considered 'violations' if any of the selected flags is True."
+)
+
+# RiskScore threshold slider (optional)
+if "RiskScore_num" in df.columns:
+    max_risk = float(np.nanmax(df["RiskScore_num"]))
+    risk_min = st.sidebar.slider(
+        "Minimum RiskScore",
+        min_value=0.0,
+        max_value=max(10.0, max_risk),
+        value=0.0,
+        step=1.0,
+    )
+else:
+    risk_min = 0.0
+
+# Optional min ZIP distance filter (for global filtered view)
+if has_zip_distance_value:
+    max_zip = float(np.nanmax(df["Patient - Pharmacy ZIP Distance_num"]))
+    zip_min_filter = st.sidebar.slider(
+        "Minimum Patient–Pharmacy ZIP Distance (miles)",
+        min_value=0.0,
+        max_value=max(10.0, max_zip),
+        value=0.0,
+        step=5.0,
+    )
+else:
+    zip_min_filter = 0.0
+
+# Apply filters to create filtered_df (for bottom preview)
+filtered_df = df.copy()
+if selected_flags:
+    filtered_df = filtered_df[filtered_df[selected_flags].any(axis=1)]
+if "RiskScore_num" in filtered_df.columns:
+    filtered_df = filtered_df[filtered_df["RiskScore_num"] >= risk_min]
+if has_zip_distance_value and zip_min_filter > 0:
+    filtered_df = filtered_df[filtered_df["Patient - Pharmacy ZIP Distance_num"] >= zip_min_filter]
+
+st.sidebar.write(f"Rows after filters: **{len(filtered_df):,}**")
+
+# =========================================
+# Overview metrics
+# =========================================
+st.subheader("Overview")
+
+col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+
+unique_patients = df["Patient Last Name"].nunique() if "Patient Last Name" in df.columns else np.nan
+unique_prescribers = df["Prescriber DEA"].nunique() if "Prescriber DEA" in df.columns else np.nan
+
+col_m1.metric("Total Records", f"{total_records:,}")
+col_m2.metric("Records with Any Violation", f"{total_with_any_violation:,}")
+col_m3.metric("Unique Patients", f"{unique_patients:,}" if pd.notna(unique_patients) else "-")
+col_m4.metric("Unique Prescribers", f"{unique_prescribers:,}" if pd.notna(unique_prescribers) else "-")
+
+# =========================================
+# Violation summary table
+# =========================================
+st.subheader("Violation Summary by Flag")
+
 if flag_cols:
     summary_rows = []
     for col in flag_cols:
@@ -169,17 +229,132 @@ if flag_cols:
 else:
     st.info("No T/F violation flag columns were found in the dataset.")
 
-st.subheader("Filtered Records (simple preview)")
+# =========================================
+# ZIP Distance violations (histogram + map)
+# =========================================
+st.subheader("ZIP Distance Violations")
 
-selected_flags = st.multiselect(
-    "Filter to records where these violation flags are True (any of them):",
-    options=flag_cols,
-    default=flag_cols,
-)
+if has_zip_distance_flag and has_zip_distance_value:
+    viol_zip_df = df[df["T/F Distance"]].copy()
+    st.markdown(
+        f"- Records flagged as **distance-related violations** (`T/F Distance = True`): "
+        f"**{len(viol_zip_df):,}**"
+    )
 
-filtered_df = df.copy()
-if selected_flags:
-    filtered_df = filtered_df[filtered_df[selected_flags].any(axis=1)]
+    # Histogram of distances
+    dist_col = "Patient - Pharmacy ZIP Distance_num"
+    dist_series = viol_zip_df[dist_col].dropna().astype(float)
+
+    if not dist_series.empty:
+        st.markdown("**Distribution of Patient–Pharmacy ZIP Distances (miles)**")
+        # Use bins for reasonable bar_chart
+        hist = dist_series.value_counts(bins=20).sort_index()
+        hist.index = hist.index.astype(str)
+        st.bar_chart(hist)
+    else:
+        st.info("No valid numeric ZIP distances found for histogram.")
+
+    # Map of patient ZIP locations
+    st.markdown("**Map of Patient ZIPs in Distance Violations (approximate locations)**")
+
+    if "Patient Zip" in viol_zip_df.columns:
+        nomi = pgeocode.Nominatim("us")
+
+        @st.cache_data(show_spinner=False)
+        def zip_to_latlon(zips):
+            zips = pd.Series(zips).dropna().astype(str).str[:5]
+            zips_unique = zips.unique()
+            locations = nomi.query_postal_code(list(zips_unique))
+            loc_df = pd.DataFrame({
+                "zip": zips_unique,
+                "lat": locations["latitude"].values,
+                "lon": locations["longitude"].values,
+            })
+            loc_df = loc_df.dropna(subset=["lat", "lon"])
+            return loc_df
+
+        patient_zip_df = zip_to_latlon(viol_zip_df["Patient Zip"])
+        if not patient_zip_df.empty:
+            st.map(patient_zip_df.rename(columns={"lat": "latitude", "lon": "longitude"}))
+        else:
+            st.info("Could not resolve any patient ZIP codes to coordinates for mapping.")
+    else:
+        st.info("Column 'Patient Zip' not found; cannot generate map.")
+
+else:
+    st.info("ZIP distance violation data (`T/F Distance` and/or `Patient - Pharmacy ZIP Distance`) not available.")
+
+# =========================================
+# Impossible Days Supply – explanation & examples
+# =========================================
+st.subheader("Impossible Days Supply – Explanation & Examples")
+
+if has_impossible_days_flag:
+    imp_df = df[df["T/F Impossible Days Supply"]].copy()
+    count_imp = len(imp_df)
+
+    st.markdown(
+        f"- Records flagged as **Impossible Days Supply** "
+        f"(`T/F Impossible Days Supply = True`): **{count_imp:,}**"
+    )
+
+    with st.expander("How 'Impossible Days Supply' is computed (conceptual rules)"):
+        st.markdown(
+            """
+            The **'T/F Impossible Days Supply'** flag identifies prescriptions where the
+            reported **Days’ Supply** is unlikely or inconsistent, given the quantity and
+            general real-world constraints. Typical checks include:
+            
+            - **Missing or zero Days’ Supply with positive Quantity**  
+              - Example: 30 tablets dispensed but Days’ Supply is 0 or blank.
+            - **Days’ Supply greater than a maximum practical limit**  
+              - For example, more than **365 days** for any drug.  
+              - Or more than **90 days** for certain controlled substances
+                (e.g., opioids, benzodiazepines, stimulants).
+            - **Implausible Quantity-per-Day**  
+              - Compute `qty_per_day = Quantity Dispensed / Days’ Supply`.  
+              - Flag if this is **very high** (e.g., > 10 units per day) or **very low**
+                (e.g., < 0.1), suggesting the Days’ Supply was mis-entered.
+            - **Inconsistent combinations**  
+              - Very short Days’ Supply with many refills authorized.  
+              - Very long Days’ Supply for medications usually given in smaller intervals.
+            
+            These rules simulate data quality and safety checks used by pharmacies,
+            payers, and regulatory bodies when reviewing prescription claims.
+            """
+        )
+
+    # Sample rows
+    max_rows_imp = st.slider(
+        "Number of flagged 'Impossible Days Supply' rows to show",
+        min_value=5,
+        max_value=200,
+        value=20,
+        step=5,
+    )
+
+    cols_to_show = [
+        "Rx Number",
+        "Date Written",
+        "Date Filled",
+        "Quantity Dispensed",
+        "Days’ Supply",
+        "Drug Name",
+        "DEA Category",
+        "RiskScore",
+        "T/F Impossible Days Supply",
+        "Anomaly",
+    ]
+    cols_to_show = [c for c in cols_to_show if c in imp_df.columns]
+    st.dataframe(imp_df[cols_to_show].head(max_rows_imp), use_container_width=True)
+
+else:
+    st.info("No 'T/F Impossible Days Supply' flag found in the dataset.")
+
+# =========================================
+# Filtered data preview (based on sidebar selections)
+# =========================================
+st.subheader("Filtered Records (Based on Selected Flags / RiskScore / ZIP Distance)")
 
 max_rows_preview = st.slider(
     "Max rows to display in preview",
@@ -188,4 +363,5 @@ max_rows_preview = st.slider(
     value=200,
     step=50,
 )
+
 st.dataframe(filtered_df.head(max_rows_preview), use_container_width=True)
