@@ -34,10 +34,10 @@ with header_col2:
         unsafe_allow_html=True,
     )
 
-st.caption(
-    "Dashboard built on the synthetic dataset `synthetic_data_Final_Flags_and_Risk.xlsx` "
-    "for exploring potential prescription anomalies and risk patterns."
-)
+# st.caption(
+#     "Dashboard built on the synthetic dataset `synthetic_data_Final_Flags_and_Risk.xlsx` "
+#     "for exploring potential prescription anomalies and risk patterns."
+# )
 
 # =========================================
 # Data loader (from private GitHub repo via secrets)
