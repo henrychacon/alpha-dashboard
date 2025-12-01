@@ -71,7 +71,8 @@ def load_data_from_github():
         )
 
     data_bytes = resp.content
-    df = pd.read_excel(io.BytesIO(data_bytes), dtype=str)
+    # df = pd.read_excel(io.BytesIO(data_bytes), dtype=str)
+    df = pd.read_excel(io.BytesIO(data_bytes), dtype=str, engine="openpyxl")
 
     # Basic numeric conversions
     num_cols = [
